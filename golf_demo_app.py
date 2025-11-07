@@ -1,6 +1,8 @@
 import streamlit as st
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
+from bs4 import BeautifulSoup
+import re
 
 st.set_page_config(page_title="Golf Weather Forecast", page_icon="⛳", layout="wide")
 
@@ -42,7 +44,7 @@ def get_weather_score(temp, wind_speed, precipitation_prob, description):
     score -= precipitation_prob * 0.5
     
     # Weather condition penalties
-    if any(word in description.lower() for word in ['rain', 'storm', 'thunder']):
+    if any(word in description.lower() for word in ['rain', 'storm', 'thunder', 'showers']):
         score -= 40
     elif 'snow' in description.lower():
         score -= 50
@@ -60,70 +62,109 @@ def get_rating(score):
     else:
         return "Poor", "🔴"
 
-def fetch_weather(city):
-    """Fetch weather data from Open-Meteo API"""
+def fetch_weather_from_weather_com(city):
+    """Fetch weather data from Weather.com"""
     try:
-        # Geocoding to get coordinates
-        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=en&format=json"
-        geo_response = requests.get(geo_url)
-        geo_data = geo_response.json()
+        # Format city for URL
+        city_slug = city.lower().replace(',', '').replace(' ', '-')
         
-        if 'results' not in geo_data or len(geo_data['results']) == 0:
-            return None, "City not found. Please try again."
+        # Try to search for the location first
+        search_url = f"https://weather.com/weather/tenday/l/{city_slug}"
         
-        lat = geo_data['results'][0]['latitude']
-        lon = geo_data['results'][0]['longitude']
-        location_name = geo_data['results'][0]['name']
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
         
-        # Weather forecast
-        weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,windspeed_10m_max,weathercode&temperature_unit=fahrenheit&windspeed_unit=mph&timezone=America/Chicago"
-        weather_response = requests.get(weather_url)
-        weather_data = weather_response.json()
+        response = requests.get(search_url, headers=headers, timeout=10)
         
-        return weather_data, location_name
+        if response.status_code != 200:
+            return None, "Unable to fetch weather data. Please check the city name."
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Extract location name
+        location_elem = soup.find('h1', {'class': re.compile('.*Location.*')})
+        location_name = location_elem.text.strip() if location_elem else city
+        
+        # Find daily forecast cards
+        forecast_days = []
+        
+        # Look for forecast data in the page
+        details_section = soup.find_all('details', {'class': re.compile('.*DaypartDetails.*')})
+        
+        if not details_section:
+            # Try alternative parsing
+            summary_elements = soup.find_all('summary', {'class': re.compile('.*Disclosure.*')})
+            
+            for i, summary in enumerate(summary_elements[:5]):
+                try:
+                    # Extract day
+                    day_elem = summary.find('h3')
+                    day = day_elem.text.strip() if day_elem else f"Day {i+1}"
+                    
+                    # Extract temperature
+                    temp_elems = summary.find_all('span', {'data-testid': 'TemperatureValue'})
+                    temp_high = 75
+                    temp_low = 55
+                    if len(temp_elems) >= 2:
+                        temp_high = int(temp_elems[0].text.replace('°', ''))
+                        temp_low = int(temp_elems[1].text.replace('°', ''))
+                    
+                    # Extract precipitation
+                    precip_elem = summary.find('span', {'data-testid': 'PercentageValue'})
+                    precip_prob = int(precip_elem.text.replace('%', '')) if precip_elem else 0
+                    
+                    # Extract wind
+                    wind_elem = summary.find('span', {'data-testid': 'Wind'})
+                    wind_speed = 5
+                    if wind_elem:
+                        wind_text = wind_elem.text
+                        wind_match = re.search(r'(\d+)', wind_text)
+                        if wind_match:
+                            wind_speed = int(wind_match.group(1))
+                    
+                    # Extract description
+                    desc_elem = summary.find('span', {'data-testid': 'wxPhrase'})
+                    description = desc_elem.text.strip() if desc_elem else "Partly Cloudy"
+                    
+                    forecast_days.append({
+                        'day': day,
+                        'temp_high': temp_high,
+                        'temp_low': temp_low,
+                        'precip_prob': precip_prob,
+                        'wind_speed': wind_speed,
+                        'description': description
+                    })
+                except Exception as e:
+                    continue
+        
+        if len(forecast_days) == 0:
+            return None, "Unable to parse weather data from Weather.com. Please try again."
+        
+        return forecast_days, location_name
+        
     except Exception as e:
         return None, f"Error fetching weather: {str(e)}"
 
-def get_weather_description(code):
-    """Convert weather code to description"""
-    weather_codes = {
-        0: "Clear sky",
-        1: "Mainly clear",
-        2: "Partly cloudy",
-        3: "Overcast",
-        45: "Foggy",
-        48: "Foggy",
-        51: "Light drizzle",
-        61: "Light rain",
-        63: "Moderate rain",
-        65: "Heavy rain",
-        71: "Light snow",
-        80: "Rain showers",
-        95: "Thunderstorm"
-    }
-    return weather_codes.get(code, "Unknown")
-
 if search_button or city:
-    with st.spinner("Fetching weather data..."):
-        weather_data, location = fetch_weather(city)
+    with st.spinner("Fetching weather data from Weather.com..."):
+        forecast_data, location = fetch_weather_from_weather_com(city)
         
-        if weather_data is None:
+        if forecast_data is None:
             st.error(location)
+            st.info("💡 Tip: Try entering your city in this format: 'Nashville, TN' or 'Phoenix, AZ'")
         else:
             st.success(f"📍 Showing forecast for: **{location}**")
+            st.caption("Data from Weather.com")
             st.write("")
             
-            # Display 5-day forecast
-            daily = weather_data['daily']
-            
-            for i in range(5):
-                date = datetime.fromisoformat(daily['time'][i])
-                temp_max = daily['temperature_2m_max'][i]
-                temp_min = daily['temperature_2m_min'][i]
-                wind_speed = daily['windspeed_10m_max'][i]
-                precip_prob = daily['precipitation_probability_max'][i]
-                weather_code = daily['weathercode'][i]
-                description = get_weather_description(weather_code)
+            # Display forecast
+            for day_data in forecast_data[:5]:
+                temp_max = day_data['temp_high']
+                temp_min = day_data['temp_low']
+                wind_speed = day_data['wind_speed']
+                precip_prob = day_data['precip_prob']
+                description = day_data['description']
                 
                 score = get_weather_score(temp_max, wind_speed, precip_prob, description)
                 rating, emoji = get_rating(score)
@@ -133,16 +174,16 @@ if search_button or city:
                     col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 2, 1])
                     
                     with col1:
-                        st.markdown(f"**{date.strftime('%A, %b %d')}**")
+                        st.markdown(f"**{day_data['day']}**")
                     
                     with col2:
-                        st.write(f"🌡️ {temp_min:.0f}°F - {temp_max:.0f}°F")
+                        st.write(f"🌡️ {temp_min}°F - {temp_max}°F")
                     
                     with col3:
-                        st.write(f"💨 {wind_speed:.0f} mph")
+                        st.write(f"💨 {wind_speed} mph")
                     
                     with col4:
-                        st.write(f"💧 {precip_prob:.0f}% rain")
+                        st.write(f"💧 {precip_prob}% rain")
                     
                     with col5:
                         st.markdown(f"### {emoji}")
@@ -151,4 +192,4 @@ if search_button or city:
                     st.divider()
 
 st.markdown("---")
-st.caption("Data provided by Open-Meteo API • Best conditions: 65-80°F, low wind, no precipitation")
+st.caption("Data scraped from Weather.com • Best conditions: 65-80°F, low wind, no precipitation")
